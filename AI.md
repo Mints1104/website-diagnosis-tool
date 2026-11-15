@@ -44,3 +44,8 @@ This project is assisted by Claude Code.
 - Claude added my test output to RESEARCH.md and fixed typos.
 - Claude was used to draft commit messages which was reviewed before committing.
 - Claude wrote `diagnose` and `DiagnosisResult` after I made the design decisions (one field per step, invalid URLs raise ValueError, total_ms as a property). I tested one URL failing at each step and checked total_ms by hand.
+
+## Day 7 (15/11/2026)
+
+- Claude wrote app.py after I made the design decisions (separate file, one table row per step, failed step + raw error, pinned requirements.txt). I tested it in the browser with a working URL, a redirect, a failure at DNS and TLS, and invalid input.
+- Claude was used to draft commit messages which was reviewed before committing.
