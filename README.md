@@ -8,7 +8,7 @@ I used this project as a way to learn what actually happens when a browser loads
 
 A diagnosis tool was a good fit for that, because to time each step separately I had to understand where one step ends and the next begins.
 
-Each step uses Python's built-in `socket` and `ssl` modules directly. I worked with Claude Code: I made the design decisions, Claude wrote most of the code, and I tested every step and checked the results against tools like `nslookup`, `ping` and `curl`. My research for each step is in [RESEARCH.md](RESEARCH.md), and how I used and checked the AI is in [AI.md](AI.md).
+Each step uses Python's built-in `socket` and `ssl` modules directly. This project was made through the assistance of Claude Code. I made the major design decisions, while Claude wrote focused on writing code, and I tested every step and checked the results against tools like `nslookup`, `ping` and `curl`. My research for each step is in [RESEARCH.md](RESEARCH.md), and how I used and checked the AI is in [AI.md](AI.md).
 
 ## How to run it
 
