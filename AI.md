@@ -49,3 +49,10 @@ This project is assisted by Claude Code.
 
 - Claude wrote app.py after I made the design decisions (separate file, one table row per step, failed step + raw error, pinned requirements.txt). I tested it in the browser with a working URL, a redirect, a failure at DNS and TLS, and invalid input.
 - Claude was used to draft commit messages which was reviewed before committing.
+
+## Day 8 (16/11/2026)
+
+- I asked a second AI to walk me through http_get line by line. It found that a non-ASCII URL crashed the tool (UnicodeEncodeError isn't an OSError). I confirmed it with `diagnose('example.com/café')`, then caught UnicodeError. Claude had noted this as a parked issue but it hadn't made it into the README.
+- The same review flagged a possible CR/LF header injection; I tested it and found urlparse already strips \r\n, so it didn't apply.
+- Claude was used to draft commit messages which was reviewed before committing.
+

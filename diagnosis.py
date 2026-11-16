@@ -21,9 +21,11 @@ def parse_url(url: str) -> ParsedUrl:
     url = url.strip()
     if not url:
         raise ValueError("URL is empty")
+    # Without a scheme, urlparse treats "example.com" as a path and finds no hostname
     if "://" not in url:
         url = "https://" + url
 
+    # urlparse also lowercases the hostname and strips the port (e.g. ":8443") out of it
     parts = urlparse(url)
     if parts.scheme != "https":
         raise ValueError(f"Only https:// URLs are supported, got {parts.scheme}://")
@@ -47,6 +49,8 @@ def resolve_dns(hostname: str) -> DnsResult:
     """
     start = time.perf_counter()
     try:
+        # AF_INET limits results to IPv4.
+        # SOCK_STREAM avoids duplicate entries per socket type.
         results = socket.getaddrinfo(
             hostname, 443, family=socket.AF_INET, type=socket.SOCK_STREAM
         )
@@ -55,6 +59,8 @@ def resolve_dns(hostname: str) -> DnsResult:
         return DnsResult(ip=None, duration_ms=duration_ms, error=str(e))
     duration_ms = (time.perf_counter() - start) * 1000
 
+    # Each result is (family, type, proto, canonname, sockaddr), and for
+    # IPv4 sockaddr is (ip,port). Take the IP from the first result.
     ip = results[0][4][0]
     return DnsResult(ip=ip, duration_ms=duration_ms)
 
@@ -74,8 +80,10 @@ def connect_tcp(ip: str, timeout: float = 5.0) -> TcpResult:
     """
     start = time.perf_counter()
     try:
+        # Returns once the three-way handshake (SYN, SYN-ACK, ACK) is done.
+        # The timeout stays set on the socket, so the TLS and HTTP steps use it too.
         sock = socket.create_connection((ip, 443), timeout=timeout)
-    except OSError as e:
+    except OSError as e:  # covers refused, timed out and unreachable
         duration_ms = (time.perf_counter() - start) * 1000
         return TcpResult(sock=None, duration_ms=duration_ms, error=f"{type(e).__name__}: {e}")
     duration_ms = (time.perf_counter() - start) * 1000
@@ -98,11 +106,15 @@ def tls_handshake(sock: socket.socket, hostname: str) -> TlsResult:
     On success the TLS socket is left open for the HTTP step; the caller must close it.
     On failure the TCP socket is closed here and the error is returned, not raised.
     """
+    # Loads the trusted root certificates from the Windows certificate store and turns on
+    # certificate and hostname checking. It does not check revocation (see RESEARCH.md (11)).
     context = ssl.create_default_context()
     start = time.perf_counter()
     try:
+        # The handshake happens here. server_hostname is sent to the server (SNI) so it knows
+        # which site's certificate to send, and is what the certificate is checked against.
         tls_sock = context.wrap_socket(sock, server_hostname=hostname)
-    except OSError as e:
+    except OSError as e:  # SSLCertVerificationError is a subclass of OSError
         duration_ms = (time.perf_counter() - start) * 1000
         sock.close()
         return TlsResult(sock=None, duration_ms=duration_ms, error=f"{type(e).__name__}: {e}")
@@ -126,18 +138,25 @@ def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
     Reads the status line and headers only, not the body.
     The socket is always closed here, since this is the last step.
     A failed request is returned as a result with `error` set, not raised.
+    Relies on the socket's timeout (set by connect_tcp) so a silent server can't block forever.
     """
+    # HTTP lines end with \r\n, and a blank line ends the headers.
+    # Host says which site we want, since one IP can serve many sites.
+    # Connection: close asks the server to close the connection after replying.
     request = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {hostname}\r\n"
+        "User-Agent: website-diagnosis/1.0\r\n"
         "Connection: close\r\n"
         "\r\n"
     )
 
     start = time.perf_counter()
     try:
-        sock.sendall(request.encode("ascii"))
-        data = sock.recv(4096)
+        sock.sendall(request.encode("ascii"))  # sendall keeps sending until every byte is sent
+        data = sock.recv(4096)  # waits for up to 4096 bytes; b"" means the server closed
+        # Stop the clock at the first bytes back (time to first byte).
+        # Reading the rest of the headers below is not counted.
         duration_ms = (time.perf_counter() - start) * 1000
         # Keep reading until the end of the headers (a blank line), in case they span several chunks
         while data and b"\r\n\r\n" not in data:
@@ -145,7 +164,7 @@ def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
             if not chunk:
                 break
             data += chunk
-    except OSError as e:
+    except (OSError, UnicodeError) as e:  # UnicodeError: non-ASCII characters in the URL
         duration_ms = (time.perf_counter() - start) * 1000
         return HttpResult(status_code=None, duration_ms=duration_ms, error=f"{type(e).__name__}: {e}")
     finally:
@@ -155,17 +174,20 @@ def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
         return HttpResult(status_code=None, duration_ms=duration_ms,
                           error="Server closed the connection without responding")
 
+    # Headers are latin-1 by convention, and this decoding can't fail.
     head = data.split(b"\r\n\r\n")[0].decode("iso-8859-1")
     lines = head.split("\r\n")
-    parts = lines[0].split(" ", 2)  # e.g. ["HTTP/1.1", "200", "OK"]
+    # Split at most twice so a reason with spaces stays whole: ["HTTP/1.1", "301", "Moved Permanently"]
+    parts = lines[0].split(" ", 2)
     if len(parts) < 2 or not parts[1].isdigit():
         return HttpResult(status_code=None, duration_ms=duration_ms,
                           error=f"Unexpected response: {lines[0]!r}")
 
+    # Pull out Location so the caller can see where a redirect (3xx) points. It isn't followed.
     location = None
     for line in lines[1:]:
-        name, _, value = line.partition(":")
-        if name.strip().lower() == "location":
+        name, _, value = line.partition(":")  # split at the first colon only (URLs contain colons)
+        if name.strip().lower() == "location":  # header names are case-insensitive
             location = value.strip()
 
     return HttpResult(
@@ -207,6 +229,7 @@ def diagnose(url: str) -> DiagnosisResult:
     if result.tcp.error:
         return result
 
+    # Each step hands its open socket to the next one: TCP socket -> TLS, TLS socket -> HTTP
     result.tls = tls_handshake(result.tcp.sock, parsed.hostname)
     if result.tls.error:
         return result
@@ -216,40 +239,8 @@ def diagnose(url: str) -> DiagnosisResult:
 
 
 if __name__ == "__main__":
-    print(parse_url("https://example.com/page?x=1"))
-    print(parse_url("example.com"))
-    print(resolve_dns("example.com"))
-    print(resolve_dns("doesnotexist.invalid"))
-    print(parse_url(" example.com"))
-    print(parse_url("EXAMPLE.COM"))
-    print(parse_url("https://example.com:8443/x"))
-    #print(parse_url("http://example.com"))
-
-    dns = resolve_dns("example.com")
-    tcp = connect_tcp(dns.ip)
-    print(tcp)
-    if tcp.sock:
-        tcp.sock.close()
-
-    # TLS: one good site, then sites with deliberately broken certificates
-    for host in ["example.com", "expired.badssl.com", "self-signed.badssl.com", "wrong.host.badssl.com"]:
-        dns = resolve_dns(host)
-        tcp = connect_tcp(dns.ip)
-        tls = tls_handshake(tcp.sock, host)
-        print(host, "->", tls)
-        if tls.sock:
-            tls.sock.close()
-
-    # HTTP: a normal page, then one that redirects (google.com -> www.google.com)
-    for host in ["example.com", "google.com"]:
-        dns = resolve_dns(host)
-        tcp = connect_tcp(dns.ip)
-        tls = tls_handshake(tcp.sock, host)
-        http = http_get(tls.sock, host, "/")
-        print(host, "->", http)
-
-    # diagnose(): one URL that works, then one failure at each step
-    print()
+    # Manual check: one URL that works, one that redirects, then one failure at each step
+    # (parse_url is covered by the automated tests in test_diagnosis.py)
     for url in [
         "example.com",  # all steps succeed
         "google.com",  # succeeds with a 301 redirect
@@ -266,6 +257,3 @@ if __name__ == "__main__":
         diagnose("http://example.com")  # invalid input: should raise
     except ValueError as e:
         print("ValueError:", e)
-
-
-
