@@ -1,5 +1,7 @@
 """Streamlit page for diagnosing a website: enter a URL, see how long each step takes."""
 
+from contextlib import closing
+
 import pandas as pd
 import streamlit as st
 
@@ -144,11 +146,17 @@ def diagnose_tab() -> None:
 
 
 def monitor_tab() -> None:
+    # Streamlit reruns this script on every interaction, so open the database for this run only.
+    # (sqlite3 connections can't be shared between the threads Streamlit uses.)
+    with closing(monitor.connect()) as conn:
+        _monitor_tab(conn)
+
+
+def _monitor_tab(conn) -> None:
     st.write(
         "Check a URL several times and keep the results, so a one-off slow check can be told apart "
         "from a real problem. For long-running monitoring use `python cli.py monitor URL`."
     )
-    conn = monitor.connect()
 
     url = st.text_input("URL to monitor", placeholder="example.com", key="monitor-url")
     col1, col2 = st.columns(2)
