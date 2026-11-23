@@ -273,6 +273,7 @@ class HttpResult:
     duration_ms: float  # time from sending the request to the first byte of the response
     reason: str | None = None  # e.g. "OK"
     location: str | None = None  # where a redirect points to; None if not a redirect
+    headers: dict[str, str] = field(default_factory=dict)  # response headers, lowercase names
     error: str | None = None  # None if the request succeeded
     error_detail: str | None = None  # raw exception text behind `error`
 
@@ -331,19 +332,97 @@ def http_get(sock: socket.socket, host: str, path: str) -> HttpResult:
         return HttpResult(status_code=None, duration_ms=duration_ms,
                           error=f"Unexpected response: {lines[0]!r}")
 
-    # Pull out Location so the caller can see where a redirect (3xx) points. It isn't followed.
-    location = None
+    headers: dict[str, str] = {}
     for line in lines[1:]:
         name, _, value = line.partition(":")  # split at the first colon only (URLs contain colons)
-        if name.strip().lower() == "location":  # header names are case-insensitive
-            location = value.strip()
+        name = name.strip().lower()  # header names are case-insensitive
+        # A header sent more than once is combined with ", " (RFC 9110 section 5.3)
+        headers[name] = f"{headers[name]}, {value.strip()}" if name in headers else value.strip()
 
     return HttpResult(
         status_code=int(parts[1]),
         duration_ms=duration_ms,
         reason=parts[2] if len(parts) == 3 else "",
-        location=location,
+        location=headers.get("location"),  # where a redirect (3xx) points
+        headers=headers,
     )
+
+
+@dataclass
+class HeaderCheck:
+    header: str  # e.g. "Strict-Transport-Security"
+    status: str  # "pass", "warn", "missing" or "n/a"
+    value: str | None  # the header's value, if sent
+    note: str  # what it does, or what's wrong
+
+
+HSTS_MIN_SECONDS = 180 * 24 * 3600  # Mozilla's guidelines recommend at least 6 months
+
+
+def check_security_headers(headers: dict[str, str], scheme: str) -> list[HeaderCheck]:
+    """Grade the response headers that protect browsers against common attacks.
+
+    `headers` uses lowercase names, as HttpResult.headers does.
+    Guidance: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers and
+    https://owasp.org/www-project-secure-headers/
+    """
+    checks = []
+
+    hsts = headers.get("strict-transport-security")
+    if scheme == "http":
+        # Browsers ignore HSTS sent over plain HTTP (RFC 6797 section 7.2)
+        checks.append(HeaderCheck("Strict-Transport-Security", "n/a", hsts, "Only applies to https://"))
+    elif hsts is None:
+        checks.append(HeaderCheck("Strict-Transport-Security", "missing", None,
+                                  "Browsers may connect over plain HTTP first, which can be intercepted"))
+    else:
+        max_age = 0
+        for directive in hsts.split(";"):
+            key, _, val = directive.strip().partition("=")
+            if key.lower() == "max-age" and val.strip('"').isdigit():
+                max_age = int(val.strip('"'))
+        if max_age >= HSTS_MIN_SECONDS:
+            checks.append(HeaderCheck("Strict-Transport-Security", "pass", hsts,
+                                      f"Browsers will use HTTPS only for {max_age // 86400} days"))
+        else:
+            checks.append(HeaderCheck("Strict-Transport-Security", "warn", hsts,
+                                      f"max-age is {max_age} s; at least 6 months is recommended"))
+
+    csp = headers.get("content-security-policy")
+    checks.append(HeaderCheck("Content-Security-Policy", "pass" if csp else "missing", csp,
+                              "Limits where scripts and other content can load from" if csp
+                              else "No policy limiting scripts, which makes cross-site scripting easier"))
+
+    xcto = headers.get("x-content-type-options")
+    if xcto and xcto.lower() == "nosniff":
+        checks.append(HeaderCheck("X-Content-Type-Options", "pass", xcto, "Stops browsers guessing file types"))
+    else:
+        checks.append(HeaderCheck("X-Content-Type-Options", "warn" if xcto else "missing", xcto,
+                                  "Should be 'nosniff' so browsers don't guess file types"))
+
+    # Clickjacking: either X-Frame-Options or the newer CSP frame-ancestors directive works
+    xfo = headers.get("x-frame-options")
+    if csp and "frame-ancestors" in csp.lower():
+        checks.append(HeaderCheck("X-Frame-Options", "pass", xfo, "Framing is controlled by CSP frame-ancestors"))
+    elif xfo and xfo.upper() in ("DENY", "SAMEORIGIN"):
+        checks.append(HeaderCheck("X-Frame-Options", "pass", xfo, "Other sites can't embed this page in a frame"))
+    else:
+        checks.append(HeaderCheck("X-Frame-Options", "warn" if xfo else "missing", xfo,
+                                  "Other sites could embed this page in a frame (clickjacking)"))
+
+    referrer = headers.get("referrer-policy")
+    if referrer and "unsafe-url" in referrer.lower():
+        checks.append(HeaderCheck("Referrer-Policy", "warn", referrer, "unsafe-url leaks full URLs to other sites"))
+    else:
+        checks.append(HeaderCheck("Referrer-Policy", "pass" if referrer else "missing", referrer,
+                                  "Controls how much of the URL is shared with other sites" if referrer
+                                  else "Browser default applies (usually strict-origin-when-cross-origin)"))
+
+    permissions = headers.get("permissions-policy")
+    checks.append(HeaderCheck("Permissions-Policy", "pass" if permissions else "missing", permissions,
+                              "Restricts browser features like camera and location" if permissions
+                              else "No restrictions on browser features like camera and location"))
+    return checks
 
 
 @dataclass

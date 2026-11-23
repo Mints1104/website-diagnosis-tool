@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from diagnosis import DiagnosisResult, RedirectChain, diagnose, follow_redirects
+from diagnosis import DiagnosisResult, RedirectChain, check_security_headers, diagnose, follow_redirects
 
 
 def step_rows(result: DiagnosisResult) -> list[dict]:
@@ -70,6 +70,24 @@ def show_result(result: DiagnosisResult, key: str) -> None:
             hide_index=True,
             key=f"cert-{key}",
         )
+
+    # Security headers matter on the page the browser ends up on, so skip them for redirects
+    if result.http and result.http.status_code and not result.http.location:
+        checks = check_security_headers(result.http.headers, result.url.scheme)
+        passed = sum(c.status == "pass" for c in checks)
+        applicable = sum(c.status != "n/a" for c in checks)
+        st.markdown(f"**Security headers** ({passed}/{applicable} pass)")
+        icons = {"pass": "✅", "warn": "⚠️", "missing": "❌", "n/a": "➖"}
+        st.dataframe(
+            [
+                {"Header": c.header, "Status": f"{icons[c.status]} {c.status}", "Note": c.note, "Value": c.value or ""}
+                for c in checks
+            ],
+            hide_index=True,
+            key=f"headers-{key}",
+        )
+        with st.expander("All response headers"):
+            st.code("\n".join(f"{name}: {value}" for name, value in result.http.headers.items()), language=None)
 
 
 def show_chain(chain: RedirectChain) -> None:
