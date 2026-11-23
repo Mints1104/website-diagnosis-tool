@@ -47,3 +47,20 @@ if st.button("Diagnose"):
 
     st.dataframe(rows, hide_index=True)
     st.metric("Total time", f"{result.total_ms:.1f} ms")
+
+    if result.tls and result.tls.cert:
+        cert = result.tls.cert
+        st.subheader("Certificate")
+        if cert.expires_soon:
+            st.warning(f"The certificate expires in {cert.days_remaining} days")
+        st.dataframe(
+            [
+                {"Field": "Issued to", "Value": cert.subject},
+                {"Field": "Issued by", "Value": cert.issuer},
+                {"Field": "Valid from", "Value": f"{cert.not_before:%Y-%m-%d}"},
+                {"Field": "Expires", "Value": f"{cert.not_after:%Y-%m-%d} ({cert.days_remaining} days left)"},
+                {"Field": "Covers", "Value": ", ".join(cert.alt_names)},
+                {"Field": "Protocol", "Value": f"{result.tls.version}, {result.tls.cipher}"},
+            ],
+            hide_index=True,
+        )

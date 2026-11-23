@@ -3,7 +3,8 @@
 import socket
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 
@@ -143,11 +144,56 @@ def connect_tcp(ip: str, timeout: float = 5.0) -> TcpResult:
     return TcpResult(sock=sock, duration_ms=duration_ms)
 
 
+EXPIRY_WARNING_DAYS = 14  # warn when a certificate expires within this many days
+
+
+@dataclass
+class CertInfo:
+    subject: str  # the certificate's common name, e.g. "example.com"
+    issuer: str  # who signed it, e.g. "Cloudflare TLS Issuing ECC CA 3 (SSL Corporation)"
+    not_before: datetime  # UTC
+    not_after: datetime  # UTC
+    days_remaining: int  # whole days until not_after; negative once expired
+    alt_names: list[str] = field(default_factory=list)  # hostnames the certificate covers
+
+    @property
+    def expires_soon(self) -> bool:
+        return self.days_remaining <= EXPIRY_WARNING_DAYS
+
+
+def _cert_name(name: tuple) -> dict[str, str]:
+    """getpeercert() stores names as ((("commonName", "x"),), ...); flatten to a dict."""
+    return {key: value for rdn in name for key, value in rdn}
+
+
+def parse_certificate(cert: dict, now: datetime | None = None) -> CertInfo:
+    """Turn the dict from SSLSocket.getpeercert() into a CertInfo."""
+    now = now or datetime.now(timezone.utc)
+    subject = _cert_name(cert.get("subject", ()))
+    issuer = _cert_name(cert.get("issuer", ()))
+    issuer_text = issuer.get("commonName", "unknown")
+    if "organizationName" in issuer:
+        issuer_text += f" ({issuer['organizationName']})"
+    # ssl.cert_time_to_seconds parses OpenSSL's "Dec 25 22:56:35 2026 GMT" format
+    not_before = datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notBefore"]), timezone.utc)
+    not_after = datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), timezone.utc)
+    return CertInfo(
+        subject=subject.get("commonName", ""),
+        issuer=issuer_text,
+        not_before=not_before,
+        not_after=not_after,
+        days_remaining=(not_after - now).days,
+        alt_names=[value for kind, value in cert.get("subjectAltName", ()) if kind == "DNS"],
+    )
+
+
 @dataclass
 class TlsResult:
     sock: ssl.SSLSocket | None  # the encrypted connection; None if the handshake failed
     duration_ms: float
     version: str | None = None  # e.g. "TLSv1.3"; None if the handshake failed
+    cipher: str | None = None  # e.g. "TLS_AES_256_GCM_SHA384"
+    cert: CertInfo | None = None  # details of the server's certificate
     error: str | None = None  # None if the handshake succeeded
     error_detail: str | None = None  # raw exception text behind `error`
 
@@ -174,7 +220,14 @@ def tls_handshake(sock: socket.socket, hostname: str) -> TlsResult:
                          error=friendly_error(e, sock.gettimeout()), error_detail=raw_error(e))
     duration_ms = (time.perf_counter() - start) * 1000
 
-    return TlsResult(sock=tls_sock, duration_ms=duration_ms, version=tls_sock.version())
+    return TlsResult(
+        sock=tls_sock,
+        duration_ms=duration_ms,
+        version=tls_sock.version(),
+        cipher=tls_sock.cipher()[0],
+        # getpeercert() returns the parsed certificate only because it was verified
+        cert=parse_certificate(tls_sock.getpeercert()),
+    )
 
 
 @dataclass
