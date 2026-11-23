@@ -2,13 +2,13 @@
 
 A small tool that takes a URL and times each step of loading it: **DNS lookup → TCP connect → TLS handshake → HTTP request**. It shows how long each step took and, if the site is broken, which step failed and why.
 
-## What I built and why
+## Why
 
-I used this project as a way to learn what actually happens when a browser loads a website: how DNS turns a name into an IP address, how a TCP connection is set up, what a TLS handshake does and how certificates are checked, and what an HTTP request and response look like.
+I built this to learn what actually happens when a browser loads a website: how DNS turns a name into an IP address, how a TCP connection is set up, what a TLS handshake does and how certificates are checked, and what an HTTP request and response look like.
 
 A diagnosis tool was a good fit for that, because to time each step separately I had to understand where one step ends and the next begins.
 
-Each step uses Python's built-in `socket` and `ssl` modules directly. This project was made through the assistance of Claude Code. I made the major design decisions, while Claude wrote focused on writing code, and I tested every step and checked the results against tools like `nslookup`, `ping` and `curl`. My research for each step is in [RESEARCH.md](RESEARCH.md), and how I used and checked the AI is in [AI.md](AI.md).
+Each step uses Python's built-in `socket` and `ssl` modules directly, and I checked the results against tools like `nslookup`, `ping` and `curl`. My research for each step is in [RESEARCH.md](RESEARCH.md).
 
 ## How to run it
 
@@ -68,9 +68,9 @@ I didn't write automated tests for the network steps, because tests against real
 - URLs with non-ASCII characters (e.g. `example.com/café`) are reported as an error instead of being encoded properly.
 - The header read has no size limit, so a server that sends headers forever without finishing would only be stopped by the 5 second timeout between chunks.
 
-## What I would improve with more time
+## Roadmap
 
-- **Monitoring:** check a URL repeatedly and show the history, so one-off slow results can be told apart from real problems. This was my original idea, but I chose to make the single diagnosis solid first.
+- **Monitoring:** check a URL repeatedly and show the history, so one-off slow results can be told apart from real problems.
 - Friendlier error messages, e.g. "This site's certificate has expired".
 - Support query strings, custom ports, `http://` and IPv6.
 - Properly encode non-ASCII URLs (IDNA for hostnames, percent-encoding for paths).
@@ -81,4 +81,3 @@ I didn't write automated tests for the network steps, because tests against real
 ## Other documents
 
 - [RESEARCH.md](RESEARCH.md): what I needed to learn for each step, my sources, experiments and what didn't work.
-- [AI.md](AI.md): how I used Claude Code, its mistakes, and how I checked its suggestions.
