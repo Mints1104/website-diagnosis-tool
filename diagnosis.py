@@ -5,7 +5,7 @@ import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 
 # OpenSSL verify codes for the certificate problems people most often hit.
@@ -388,6 +388,52 @@ def diagnose(url: str) -> DiagnosisResult:
 
     result.http = http_get(sock, parsed.host_header, parsed.path)
     return result
+
+
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
+@dataclass
+class RedirectChain:
+    hops: list[DiagnosisResult]  # one full diagnosis per URL visited, in order
+    warning: str | None = None  # why following stopped early, e.g. a redirect loop
+
+    @property
+    def final(self) -> DiagnosisResult:
+        return self.hops[-1]
+
+    @property
+    def total_ms(self) -> float:
+        return sum(hop.total_ms for hop in self.hops)
+
+
+def follow_redirects(url: str, max_redirects: int = 5) -> RedirectChain:
+    """Diagnose a URL and then each URL it redirects to, up to `max_redirects` times.
+
+    Every hop is a fresh diagnosis (new DNS, TCP, TLS and HTTP), like a browser opening
+    a new connection to a different host. Raises ValueError only if the first URL is invalid.
+    """
+    chain = RedirectChain(hops=[diagnose(url)])
+    seen = {str(chain.final.url)}
+    while True:
+        http = chain.final.http
+        if http is None or http.status_code not in REDIRECT_STATUSES or not http.location:
+            return chain
+        if len(chain.hops) > max_redirects:
+            chain.warning = f"Stopped after {max_redirects} redirects"
+            return chain
+        # Location may be relative ("/login"), so resolve it against the current URL
+        next_url = urljoin(str(chain.final.url), http.location)
+        try:
+            normalised = str(parse_url(next_url))  # compare URLs in the same form
+        except ValueError as e:
+            chain.warning = f"Can't follow redirect to {next_url}: {e}"
+            return chain
+        if normalised in seen:
+            chain.warning = f"Redirect loop: {normalised} was already visited"
+            return chain
+        seen.add(normalised)
+        chain.hops.append(diagnose(next_url))
 
 
 if __name__ == "__main__":
