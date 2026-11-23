@@ -7,6 +7,54 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 
+# OpenSSL verify codes for the certificate problems people most often hit.
+# Full list: https://docs.openssl.org/master/man1/openssl-verification-options/#diagnostics
+_CERT_ERRORS = {
+    9: "The site's certificate is not valid yet (check your computer's clock)",
+    10: "The site's certificate has expired",
+    18: "The site uses a self-signed certificate, which browsers don't trust",
+    19: "The site's certificate chain ends in a self-signed root that isn't trusted",
+    20: "The site's certificate was issued by an authority this computer doesn't trust",
+    21: "The site's certificate chain is incomplete (a missing intermediate certificate)",
+    23: "The site's certificate has been revoked",
+    62: "The site's certificate is for a different hostname",
+}
+
+# Windows (WSA*) and POSIX errno values for "no route to the host or network".
+_UNREACHABLE_ERRNOS = {10051, 10065, 101, 113, 51, 65}
+
+
+def friendly_error(exc: BaseException, timeout: float | None = None) -> str:
+    """Turn a low-level exception into a short, plain-English explanation."""
+    if isinstance(exc, socket.gaierror):
+        # 11001 (WSAHOST_NOT_FOUND) / 11004 (WSANO_DATA) on Windows; EAI_NONAME elsewhere
+        if exc.errno in (11001, 11004, socket.EAI_NONAME, getattr(socket, "EAI_NODATA", None)):
+            return "Domain not found: there is no DNS record for this hostname"
+        return "DNS lookup failed (your DNS server may be unreachable)"
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return _CERT_ERRORS.get(exc.verify_code, f"The site's certificate failed verification ({exc.verify_message})")
+    if isinstance(exc, ssl.SSLError):
+        return "The TLS handshake failed (the server may not support a secure protocol version this client accepts)"
+    # TimeoutError is checked before OSError, since it's a subclass of it
+    if isinstance(exc, TimeoutError):
+        after = f" after {timeout:g} s" if timeout else ""
+        return f"Timed out{after}: the server didn't answer (it may be down, or a firewall is dropping traffic)"
+    if isinstance(exc, ConnectionRefusedError):
+        return "Connection refused: the host is up but nothing is listening on that port"
+    if isinstance(exc, ConnectionResetError):
+        return "The server reset the connection"
+    if isinstance(exc, UnicodeError):
+        return "The URL contains characters that can't be sent in a request"
+    if isinstance(exc, OSError) and exc.errno in _UNREACHABLE_ERRNOS:
+        return "Network unreachable: there is no route to this host"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def raw_error(exc: BaseException) -> str:
+    """The raw exception text, kept alongside the friendly message for debugging."""
+    return f"{type(exc).__name__}: {exc}"
+
+
 @dataclass
 class ParsedUrl:
     hostname: str
@@ -40,6 +88,7 @@ class DnsResult:
     ip: str | None  # None if the lookup failed
     duration_ms: float
     error: str | None = None  # None if the lookup succeeded
+    error_detail: str | None = None  # raw exception text behind `error`
 
 
 def resolve_dns(hostname: str) -> DnsResult:
@@ -56,7 +105,8 @@ def resolve_dns(hostname: str) -> DnsResult:
         )
     except socket.gaierror as e:
         duration_ms = (time.perf_counter() - start) * 1000
-        return DnsResult(ip=None, duration_ms=duration_ms, error=str(e))
+        return DnsResult(ip=None, duration_ms=duration_ms,
+                         error=friendly_error(e), error_detail=raw_error(e))
     duration_ms = (time.perf_counter() - start) * 1000
 
     # Each result is (family, type, proto, canonname, sockaddr), and for
@@ -70,6 +120,7 @@ class TcpResult:
     sock: socket.socket | None  # the open connection; None if connecting failed
     duration_ms: float
     error: str | None = None  # None if the connection succeeded
+    error_detail: str | None = None  # raw exception text behind `error`
 
 
 def connect_tcp(ip: str, timeout: float = 5.0) -> TcpResult:
@@ -85,7 +136,8 @@ def connect_tcp(ip: str, timeout: float = 5.0) -> TcpResult:
         sock = socket.create_connection((ip, 443), timeout=timeout)
     except OSError as e:  # covers refused, timed out and unreachable
         duration_ms = (time.perf_counter() - start) * 1000
-        return TcpResult(sock=None, duration_ms=duration_ms, error=f"{type(e).__name__}: {e}")
+        return TcpResult(sock=None, duration_ms=duration_ms,
+                         error=friendly_error(e, timeout), error_detail=raw_error(e))
     duration_ms = (time.perf_counter() - start) * 1000
 
     return TcpResult(sock=sock, duration_ms=duration_ms)
@@ -97,6 +149,7 @@ class TlsResult:
     duration_ms: float
     version: str | None = None  # e.g. "TLSv1.3"; None if the handshake failed
     error: str | None = None  # None if the handshake succeeded
+    error_detail: str | None = None  # raw exception text behind `error`
 
 
 def tls_handshake(sock: socket.socket, hostname: str) -> TlsResult:
@@ -117,7 +170,8 @@ def tls_handshake(sock: socket.socket, hostname: str) -> TlsResult:
     except OSError as e:  # SSLCertVerificationError is a subclass of OSError
         duration_ms = (time.perf_counter() - start) * 1000
         sock.close()
-        return TlsResult(sock=None, duration_ms=duration_ms, error=f"{type(e).__name__}: {e}")
+        return TlsResult(sock=None, duration_ms=duration_ms,
+                         error=friendly_error(e, sock.gettimeout()), error_detail=raw_error(e))
     duration_ms = (time.perf_counter() - start) * 1000
 
     return TlsResult(sock=tls_sock, duration_ms=duration_ms, version=tls_sock.version())
@@ -130,6 +184,7 @@ class HttpResult:
     reason: str | None = None  # e.g. "OK"
     location: str | None = None  # where a redirect points to; None if not a redirect
     error: str | None = None  # None if the request succeeded
+    error_detail: str | None = None  # raw exception text behind `error`
 
 
 def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
@@ -166,7 +221,8 @@ def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
             data += chunk
     except (OSError, UnicodeError) as e:  # UnicodeError: non-ASCII characters in the URL
         duration_ms = (time.perf_counter() - start) * 1000
-        return HttpResult(status_code=None, duration_ms=duration_ms, error=f"{type(e).__name__}: {e}")
+        return HttpResult(status_code=None, duration_ms=duration_ms,
+                          error=friendly_error(e, sock.gettimeout()), error_detail=raw_error(e))
     finally:
         sock.close()
 

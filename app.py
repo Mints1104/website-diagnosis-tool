@@ -31,12 +31,15 @@ if st.button("Diagnose"):
             rows.append({"Step": name, "Time (ms)": "", "Status": "⏭️ Not reached"})
         elif step.error:
             rows.append({"Step": name, "Time (ms)": f"{step.duration_ms:.1f}", "Status": "❌ Failed"})
-            failed = (name, step.error)
+            failed = (name, step.error, step.error_detail)
         else:
             rows.append({"Step": name, "Time (ms)": f"{step.duration_ms:.1f}", "Status": "✅ OK"})
 
     if failed:
         st.error(f"Failed at {failed[0]}: {failed[1]}")
+        if failed[2]:
+            with st.expander("Technical details"):
+                st.code(failed[2], language=None)
     else:
         st.success(f"HTTP {result.http.status_code} {result.http.reason}")
         if result.http.location:
