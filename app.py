@@ -24,10 +24,18 @@ if st.button("Diagnose"):
         ("HTTP", result.http),
     ]
 
+    st.caption(f"Diagnosing {result.url}")
+    if result.dns.ip:
+        others = len(result.dns.all_ips) - 1
+        extra = f" (+{others} more)" if others else ""
+        st.caption(f"Connecting to {result.dns.ip} ({result.dns.ip_version}){extra}")
+
     rows = []
-    failed = None  # (step name, error) of the first step that failed
+    failed = None  # (step name, error, raw error) of the first step that failed
     for name, step in steps:
-        if step is None:
+        if step is None and name == "TLS" and result.url.scheme == "http":
+            rows.append({"Step": name, "Time (ms)": "", "Status": "➖ Skipped (http://)"})
+        elif step is None:
             rows.append({"Step": name, "Time (ms)": "", "Status": "⏭️ Not reached"})
         elif step.error:
             rows.append({"Step": name, "Time (ms)": f"{step.duration_ms:.1f}", "Status": "❌ Failed"})

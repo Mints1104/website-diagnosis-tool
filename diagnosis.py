@@ -5,7 +5,7 @@ import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 # OpenSSL verify codes for the certificate problems people most often hit.
@@ -56,10 +56,30 @@ def raw_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Characters left unescaped in a path or query (RFC 3986 "pchar" plus "/" and "?").
+# "%" is included so an already-encoded URL isn't encoded twice.
+_URL_SAFE = "/?:@!$&'()*+,;=-._~%"
+
+
 @dataclass
 class ParsedUrl:
-    hostname: str
-    path: str
+    scheme: str  # "http" or "https"
+    hostname: str  # ASCII form: lowercased and IDNA-encoded ("bücher.de" -> "xn--bcher-kva.de")
+    port: int  # from the URL, or 80 / 443 by default
+    path: str  # percent-encoded path plus query string, e.g. "/caf%C3%A9?x=1"
+
+    @property
+    def host_header(self) -> str:
+        """The Host header value: brackets around IPv6 literals, and the port only if non-default."""
+        host = f"[{self.hostname}]" if ":" in self.hostname else self.hostname
+        if self.port != DEFAULT_PORTS[self.scheme]:
+            host += f":{self.port}"
+        return host
+
+    def __str__(self) -> str:
+        return f"{self.scheme}://{self.host_header}{self.path}"
 
 
 def parse_url(url: str) -> ParsedUrl:
@@ -74,35 +94,52 @@ def parse_url(url: str) -> ParsedUrl:
     if "://" not in url:
         url = "https://" + url
 
-    # urlparse also lowercases the hostname and strips the port (e.g. ":8443") out of it
+    # urlparse lowercases the scheme and hostname, and strips the brackets from IPv6 literals
     parts = urlparse(url)
-    if parts.scheme != "https":
-        raise ValueError(f"Only https:// URLs are supported, got {parts.scheme}://")
+    if parts.scheme not in DEFAULT_PORTS:
+        raise ValueError(f"Only http:// and https:// URLs are supported, got {parts.scheme}://")
     if not parts.hostname:
         raise ValueError("URL has no hostname")
+    try:
+        port = parts.port or DEFAULT_PORTS[parts.scheme]  # .port raises ValueError if out of range
+        # Non-ASCII hostnames are sent as punycode (IDNA); ASCII ones pass through unchanged
+        hostname = parts.hostname.encode("idna").decode("ascii")
+    except UnicodeError as e:
+        raise ValueError(f"Hostname can't be encoded: {e}") from None
 
-    return ParsedUrl(hostname=parts.hostname, path=parts.path or "/")
+    # quote() percent-encodes everything else, encoding non-ASCII characters as UTF-8 first
+    path = quote(parts.path or "/", safe=_URL_SAFE)
+    if parts.query:
+        path += "?" + quote(parts.query, safe=_URL_SAFE)
+    return ParsedUrl(scheme=parts.scheme, hostname=hostname, port=port, path=path)
 
 
 @dataclass
 class DnsResult:
-    ip: str | None  # None if the lookup failed
+    ip: str | None  # the address the next step connects to; None if the lookup failed
     duration_ms: float
     error: str | None = None  # None if the lookup succeeded
     error_detail: str | None = None  # raw exception text behind `error`
+    all_ips: list[str] = field(default_factory=list)  # every address returned, in order
+
+    @property
+    def ip_version(self) -> str | None:
+        return None if self.ip is None else ("IPv6" if ":" in self.ip else "IPv4")
 
 
-def resolve_dns(hostname: str) -> DnsResult:
-    """Look up the IPv4 address of a hostname and time how long it takes.
+def resolve_dns(hostname: str, port: int = 443) -> DnsResult:
+    """Look up the IPv4 and IPv6 addresses of a hostname and time how long it takes.
 
+    The first address is used. It follows the operating system's preference order
+    (RFC 6724), and Windows leaves out IPv6 addresses when the machine has no IPv6 route.
     A failed lookup is returned as a result with `error` set, not raised.
     """
     start = time.perf_counter()
     try:
-        # AF_INET limits results to IPv4.
+        # AF_UNSPEC returns both IPv4 and IPv6 results.
         # SOCK_STREAM avoids duplicate entries per socket type.
         results = socket.getaddrinfo(
-            hostname, 443, family=socket.AF_INET, type=socket.SOCK_STREAM
+            hostname, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
         )
     except socket.gaierror as e:
         duration_ms = (time.perf_counter() - start) * 1000
@@ -110,10 +147,10 @@ def resolve_dns(hostname: str) -> DnsResult:
                          error=friendly_error(e), error_detail=raw_error(e))
     duration_ms = (time.perf_counter() - start) * 1000
 
-    # Each result is (family, type, proto, canonname, sockaddr), and for
-    # IPv4 sockaddr is (ip,port). Take the IP from the first result.
-    ip = results[0][4][0]
-    return DnsResult(ip=ip, duration_ms=duration_ms)
+    # Each result is (family, type, proto, canonname, sockaddr). sockaddr is (ip, port) for
+    # IPv4 and (ip, port, flowinfo, scope_id) for IPv6, so the IP is first either way.
+    ips = list(dict.fromkeys(r[4][0] for r in results))  # de-duplicate, keeping the order
+    return DnsResult(ip=ips[0], duration_ms=duration_ms, all_ips=ips)
 
 
 @dataclass
@@ -124,8 +161,8 @@ class TcpResult:
     error_detail: str | None = None  # raw exception text behind `error`
 
 
-def connect_tcp(ip: str, timeout: float = 5.0) -> TcpResult:
-    """Open a TCP connection to an IP on port 443 and time how long it takes.
+def connect_tcp(ip: str, port: int = 443, timeout: float = 5.0) -> TcpResult:
+    """Open a TCP connection to an IP and port and time how long it takes.
 
     On success the socket is left open for the TLS step; the caller must close it.
     A failed connection is returned as a result with `error` set, not raised.
@@ -134,7 +171,7 @@ def connect_tcp(ip: str, timeout: float = 5.0) -> TcpResult:
     try:
         # Returns once the three-way handshake (SYN, SYN-ACK, ACK) is done.
         # The timeout stays set on the socket, so the TLS and HTTP steps use it too.
-        sock = socket.create_connection((ip, 443), timeout=timeout)
+        sock = socket.create_connection((ip, port), timeout=timeout)
     except OSError as e:  # covers refused, timed out and unreachable
         duration_ms = (time.perf_counter() - start) * 1000
         return TcpResult(sock=None, duration_ms=duration_ms,
@@ -240,9 +277,11 @@ class HttpResult:
     error_detail: str | None = None  # raw exception text behind `error`
 
 
-def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
+def http_get(sock: socket.socket, host: str, path: str) -> HttpResult:
     """Send an HTTP/1.1 GET request and time how long until the first byte of the response.
 
+    `sock` is a TLS socket for https:// or a plain TCP socket for http://.
+    `host` is the Host header value (see ParsedUrl.host_header).
     Reads the status line and headers only, not the body.
     The socket is always closed here, since this is the last step.
     A failed request is returned as a result with `error` set, not raised.
@@ -253,7 +292,7 @@ def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
     # Connection: close asks the server to close the connection after replying.
     request = (
         f"GET {path} HTTP/1.1\r\n"
-        f"Host: {hostname}\r\n"
+        f"Host: {host}\r\n"
         "User-Agent: website-diagnosis/1.0\r\n"
         "Connection: close\r\n"
         "\r\n"
@@ -272,7 +311,7 @@ def http_get(sock: ssl.SSLSocket, hostname: str, path: str) -> HttpResult:
             if not chunk:
                 break
             data += chunk
-    except (OSError, UnicodeError) as e:  # UnicodeError: non-ASCII characters in the URL
+    except OSError as e:  # parse_url already encoded the URL, so the request is always ASCII
         duration_ms = (time.perf_counter() - start) * 1000
         return HttpResult(status_code=None, duration_ms=duration_ms,
                           error=friendly_error(e, sock.gettimeout()), error_detail=raw_error(e))
@@ -312,7 +351,7 @@ class DiagnosisResult:
     url: ParsedUrl
     dns: DnsResult  # always runs, so never None
     tcp: TcpResult | None = None  # None if an earlier step failed
-    tls: TlsResult | None = None
+    tls: TlsResult | None = None  # also None for http:// URLs, which have no TLS step
     http: HttpResult | None = None
 
     @property
@@ -330,20 +369,24 @@ def diagnose(url: str) -> DiagnosisResult:
     """
     parsed = parse_url(url)
 
-    result = DiagnosisResult(url=parsed, dns=resolve_dns(parsed.hostname))
+    result = DiagnosisResult(url=parsed, dns=resolve_dns(parsed.hostname, parsed.port))
     if result.dns.error:
         return result
 
-    result.tcp = connect_tcp(result.dns.ip)
+    result.tcp = connect_tcp(result.dns.ip, parsed.port)
     if result.tcp.error:
         return result
 
-    # Each step hands its open socket to the next one: TCP socket -> TLS, TLS socket -> HTTP
-    result.tls = tls_handshake(result.tcp.sock, parsed.hostname)
-    if result.tls.error:
-        return result
+    # Each step hands its open socket to the next one: TCP socket -> TLS, TLS socket -> HTTP.
+    # Plain http:// skips TLS and sends the request straight over the TCP socket.
+    sock = result.tcp.sock
+    if parsed.scheme == "https":
+        result.tls = tls_handshake(sock, parsed.hostname)
+        if result.tls.error:
+            return result
+        sock = result.tls.sock
 
-    result.http = http_get(result.tls.sock, parsed.hostname, parsed.path)
+    result.http = http_get(sock, parsed.host_header, parsed.path)
     return result
 
 
@@ -363,6 +406,6 @@ if __name__ == "__main__":
         print()
 
     try:
-        diagnose("http://example.com")  # invalid input: should raise
+        diagnose("ftp://example.com")  # invalid input: should raise
     except ValueError as e:
         print("ValueError:", e)
