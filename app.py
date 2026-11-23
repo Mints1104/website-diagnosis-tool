@@ -1,8 +1,17 @@
 """Streamlit page for diagnosing a website: enter a URL, see how long each step takes."""
 
+import pandas as pd
 import streamlit as st
 
-from diagnosis import DiagnosisResult, RedirectChain, check_security_headers, diagnose, follow_redirects
+import monitor
+from diagnosis import (
+    DiagnosisResult,
+    RedirectChain,
+    check_security_headers,
+    diagnose,
+    follow_redirects,
+    parse_url,
+)
 
 
 def step_rows(result: DiagnosisResult) -> list[dict]:
@@ -120,17 +129,83 @@ def show_chain(chain: RedirectChain) -> None:
                 show_result(hop, key=str(i))
 
 
+def diagnose_tab() -> None:
+    url = st.text_input("URL", placeholder="example.com")
+    follow = st.checkbox("Follow redirects", value=True)
+
+    if st.button("Diagnose"):
+        try:
+            with st.spinner("Diagnosing..."):
+                chain = follow_redirects(url) if follow else RedirectChain(hops=[diagnose(url)])
+        except ValueError as e:
+            st.error(f"Invalid URL: {e}")
+            return
+        show_chain(chain)
+
+
+def monitor_tab() -> None:
+    st.write(
+        "Check a URL several times and keep the results, so a one-off slow check can be told apart "
+        "from a real problem. For long-running monitoring use `python cli.py monitor URL`."
+    )
+    conn = monitor.connect()
+
+    url = st.text_input("URL to monitor", placeholder="example.com", key="monitor-url")
+    col1, col2 = st.columns(2)
+    count = col1.number_input("Number of checks", min_value=1, max_value=100, value=5)
+    interval = col2.number_input("Seconds between checks", min_value=0, max_value=300, value=5)
+
+    if st.button("Run checks"):
+        progress = st.progress(0.0, text="Starting...")
+
+        def on_result(i, result):
+            text = f"Check {i}/{count}: {'up' if monitor.is_up(result) else 'DOWN'}, {result.total_ms:.0f} ms"
+            progress.progress(i / count, text=text)
+
+        try:
+            monitor.run_checks(conn, url, count=int(count), interval=interval, on_result=on_result)
+        except ValueError as e:
+            st.error(f"Invalid URL: {e}")
+        else:
+            # Select the URL just checked in the history below (set before the selectbox is created)
+            st.session_state["history-url"] = str(parse_url(url))
+
+    urls = monitor.monitored_urls(conn)
+    if not urls:
+        st.info("No checks recorded yet.")
+        return
+
+    st.subheader("History")
+    selected = st.selectbox("URL", urls, key="history-url")
+    rows = monitor.history(conn, selected, limit=500)
+    summary = monitor.summarize(rows)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Checks", summary.checks)
+    c2.metric("Uptime", f"{summary.uptime_pct:.1f}%")
+    c3.metric("Median", f"{summary.median_ms:.0f} ms" if summary.median_ms is not None else "–")
+    c4.metric("95th percentile", f"{summary.p95_ms:.0f} ms" if summary.p95_ms is not None else "–")
+
+    df = pd.DataFrame(rows)
+    df["checked_at"] = pd.to_datetime(df["checked_at"])
+    ok = df[df["ok"] == 1].set_index("checked_at")
+    if not ok.empty:
+        st.markdown("**Time per step (successful checks)**")
+        steps = ok[["dns_ms", "tcp_ms", "tls_ms", "http_ms"]].fillna(0)
+        st.area_chart(steps.rename(columns={"dns_ms": "DNS", "tcp_ms": "TCP", "tls_ms": "TLS", "http_ms": "HTTP"}),
+                      y_label="ms", stack=True)  # stacked, so the top edge is the total time
+
+    failures = df[df["ok"] == 0]
+    if not failures.empty:
+        st.markdown("**Failed checks**")
+        st.dataframe(failures[["checked_at", "failed_step", "error"]], hide_index=True)
+
+
 st.title("Website diagnosis")
 st.write("Times each step of loading a website: DNS lookup, TCP connect, TLS handshake and HTTP request.")
 
-url = st.text_input("URL", placeholder="example.com")
-follow = st.checkbox("Follow redirects", value=True)
-
-if st.button("Diagnose"):
-    try:
-        with st.spinner("Diagnosing..."):
-            chain = follow_redirects(url) if follow else RedirectChain(hops=[diagnose(url)])
-    except ValueError as e:
-        st.error(f"Invalid URL: {e}")
-        st.stop()
-    show_chain(chain)
+tab_diagnose, tab_monitor = st.tabs(["Diagnose", "Monitor"])
+with tab_diagnose:
+    diagnose_tab()
+with tab_monitor:
+    monitor_tab()
